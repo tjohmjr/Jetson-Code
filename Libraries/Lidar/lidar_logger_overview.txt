@@ -1,0 +1,99 @@
+LIDAR_LOGGER.PY - OVERVIEW
+==========================
+
+PURPOSE
+-------
+Records data from the RPLIDAR A1M8 on the Jetson and saves it to local storage
+so it can be analyzed later. The vehicle runs offline, so everything is stored
+on the microSD card.
+
+WHAT IT DOES
+------------
+1. Listens to the ROS2 topic /scan, which the Slamtec driver (sllidar_ros2)
+   publishes. Each message is one full 360-degree rotation of the lidar.
+2. Keeps incoming scans in memory.
+3. Every 5 seconds, writes the buffered scans to a Parquet file.
+4. Records each run ("session") in a small SQLite database.
+5. On Ctrl+C, saves any remaining scans and closes cleanly.
+
+DATA FLOW
+---------
+Lidar -> sllidar_ros2 driver -> /scan topic -> on_scan() -> memory buffer
+      -> flush() every 5 s -> Parquet file (+ SQLite session row updated)
+
+OUTPUT ON DISK
+--------------
+<output_dir>/sme.db                                  SQLite database
+<output_dir>/lidar/session=<id>/part-00000.parquet   scan data, one file per flush
+<output_dir>/lidar/session=<id>/part-00001.parquet   ...
+
+Default output_dir is ~/sme_data.
+
+WHAT IS STORED PER SCAN (one row per scan)
+------------------------------------------
+session_id        Which run the scan belongs to
+scan_idx          Order number; gaps mean dropped scans
+t_mono_ns         Monotonic clock time (ordering, latency)
+t_wall_ns         Real-world time, Chrony-synced (aligning with IMU/camera)
+t_msg_ns          Timestamp from the driver
+angle_min/max     First and last measurement angles (radians)
+angle_increment   Angle between measurements (radians)
+range_min/max     Valid distance limits (A1M8: 0.15 m to 12 m)
+scan_time         Seconds per rotation
+ranges            List of distances (m), one per angle
+intensities       List of signal strengths, one per angle
+
+SQLITE SESSIONS TABLE
+---------------------
+session_id, start_wall_ns, end_wall_ns, sensor, scan_count, notes
+One row per run. Lets you find and count sessions without opening Parquet files.
+
+PARAMETERS (set at launch with --ros-args -p name:=value)
+---------------------------------------------------------
+topic           Topic to subscribe to (default /scan)
+output_dir      Where data is saved (default ~/sme_data)
+flush_seconds   Seconds between disk writes (default 5.0)
+notes           Free-text note saved with the session
+
+EXAMPLE
+-------
+python3 lidar_logger.py --ros-args -p output_dir:=~/sme_data -p notes:="first test"
+
+KEY DESIGN DECISIONS
+--------------------
+- Buffer, then batch write: the scan callback stays fast, and fewer, larger
+  writes are gentler on the microSD card.
+- Atomic file writes: each Parquet file is written as .tmp and then renamed,
+  so a sudden power loss cannot leave a corrupt file.
+- SQLite in WAL mode: more robust against power loss.
+- Three timestamps: needed later to line up lidar with IMU and camera data.
+- Raw values kept (including inf/NaN = no return): cleaning can be redone
+  later, lost data cannot be recovered.
+- Explicit Parquet schema: every file has identical columns and types.
+- Session partitioning (session=<id>): each run is self-contained, and tools
+  like pandas, Spark, and DuckDB understand the layout.
+
+LIMITATIONS
+-----------
+- If the program crashes or power is lost, up to flush_seconds of scans
+  (still in memory) are lost. A shorter interval reduces this at the cost of
+  more small files.
+- Only the lidar is handled. The IMU and camera need their own loggers
+  following the same pattern.
+
+CODE STRUCTURE
+--------------
+LIDAR_SCHEMA            Defines the Parquet columns and types
+LidarLogger (Node)
+  __init__              Parameters, session ID, folders, subscription, timer
+  _init_db              Creates the SQLite table and inserts this session
+  on_scan               Per-scan callback; appends to the buffer
+  flush                 Writes the buffer to Parquet and updates SQLite
+  close                 Final flush and database close
+main()                  Starts ROS2, runs the node, shuts down cleanly
+
+REQUIREMENTS
+------------
+ROS2 (Humble on Ubuntu 22.04), the sllidar_ros2 driver, and the Python
+packages pyarrow (and pandas for reading data back).
+See LIDAR_SETUP.md for installation and run steps.
